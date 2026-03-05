@@ -17,8 +17,8 @@ from tqdm import tqdm
 # ─────────────────────────────────────────────
 SOURCE      = "video2.mp4"
 OUTPUT      = "output.mp4"
-MODEL_PATH  = "runs/train4/train4/weights/best.pt"
-DEVICE      = 0
+MODEL_PATH  = "weights/last.pt"
+DEVICE      = "cpu"
 FP16        = False
 IMG_SIZE    = 1280
 QUEUE_SIZE  = 64

@@ -206,12 +206,22 @@ class YOLODataset(BaseDataset):
         # Add tags for JDE training: assign unique tags to each instance in the dataset and respect the original track ids
         if self.use_tags:
             # Find the highest tag in the dataset
-            highest_tag = 0
+            highest_tag = -1
             for lb in labels:
                 if lb.get("tags") is not None:
                     lb["tags"] = lb["tags"].reshape(-1, 1) # Ensure tags are 2D
                     highest_tag = max(highest_tag, np.max(lb["tags"]))
-                    
+            
+            # Assign unique tags to labels that don't have them
+            for lb in labels:
+                num_boxes = len(lb["cls"])
+                if num_boxes > 0:
+                    if lb.get("tags") is None:
+                        lb["tags"] = np.arange(highest_tag + 1, highest_tag + 1 + num_boxes).reshape(-1, 1)
+                        highest_tag += num_boxes
+                else:
+                    lb["tags"] = np.zeros((0, 1), dtype=np.float32)
+
         return labels
 
     def build_transforms(self, hyp: dict | None = None) -> Compose:
@@ -309,7 +319,7 @@ class YOLODataset(BaseDataset):
                 value = torch.stack(value, 0)
             elif k == "visuals":
                 value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
-            if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb"}:
+            if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb", "tags"}:
                 value = torch.cat(value, 0)
             new_batch[k] = value
         new_batch["batch_idx"] = list(new_batch["batch_idx"])

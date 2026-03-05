@@ -9,9 +9,46 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from pytorch_metric_learning import miners, distances, losses, reducers
+
 from ultralytics.utils.metrics import OKS_SIGMA, RLE_WEIGHT
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
+
+
+class JDETaskAlignedAssigner(TaskAlignedAssigner):
+    """TaskAlignedAssigner extended to propagate gt_tags through assignment for JDE training."""
+
+    @torch.no_grad()
+    def forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt, gt_tags):
+        """Like TaskAlignedAssigner.forward but also accepts and returns gt_tags."""
+        self.bs = pd_scores.shape[0]
+        self.n_max_boxes = gt_bboxes.shape[1]
+        device = gt_bboxes.device
+
+        if self.n_max_boxes == 0:
+            return (
+                torch.full_like(pd_scores[..., 0], self.num_classes),
+                torch.zeros_like(pd_bboxes),
+                torch.zeros_like(pd_scores),
+                torch.zeros_like(pd_scores[..., 0]),
+                torch.zeros_like(pd_scores[..., 0]),
+                torch.zeros_like(pd_scores[..., 0]),  # empty target_tags
+            )
+
+        target_labels, target_bboxes, target_scores, fg_mask, target_gt_idx = super()._forward(
+            pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt
+        )
+
+        # Propagate tags: for each anchor, pick gt_tag of the assigned GT box
+        batch_ind = torch.arange(self.bs, dtype=torch.int64, device=device)[..., None]
+        flat_idx = target_gt_idx + batch_ind * self.n_max_boxes
+        target_tags = gt_tags.long().flatten()[flat_idx]  # (b, h*w)
+        target_tags = torch.where(fg_mask.bool(), target_tags, torch.zeros_like(target_tags))
+
+        return target_labels, target_bboxes, target_scores, fg_mask.bool(), target_gt_idx, target_tags
+
+
 from ultralytics.utils.torch_utils import autocast
 
 from .metrics import bbox_iou, probiou
@@ -47,6 +84,29 @@ class VarifocalLoss(nn.Module):
                 .mean(1)
                 .sum()
             )
+        return loss
+
+class MetricLearningLoss(nn.Module):
+    def __init__(self):
+        super(MetricLearningLoss, self).__init__()
+        self.mining_func = miners.BatchEasyHardMiner(pos_strategy='hard', neg_strategy='semihard')
+        self.loss_func = losses.TripletMarginLoss(margin=0.075)
+        self.confidence_threshold = 1
+
+    def forward(self, embeddings, tags, confidences=None, normalize=False):
+        # Select only the embeddings and tags for confidences on top X%
+        if confidences is not None and self.confidence_threshold<1:
+            top_k = int(self.confidence_threshold * len(confidences))
+            _, indices = torch.topk(confidences, top_k, largest=True)
+            embeddings = embeddings[indices]
+            tags = tags[indices]
+
+        if normalize:
+            embeddings = F.normalize(embeddings, p=2, dim=1)
+        # Sample triplets and calculate loss
+        indices_tuples = self.mining_func(embeddings, tags)
+        loss = self.loss_func(embeddings, tags, indices_tuples)
+        #loss = self.loss_func(embeddings, tags)
         return loss
 
 
@@ -488,7 +548,13 @@ class v8JDELoss:
 
         self.use_dfl = m.reg_max > 1
 
-        self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0, use_tags=True)
+        self.assigner = JDETaskAlignedAssigner(
+            topk=tal_topk,
+            num_classes=self.nc,
+            alpha=0.5,
+            beta=6.0,
+            stride=m.stride.tolist(),
+        )
         self.bbox_loss = BboxLoss(m.reg_max).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
         self.embed_loss = MetricLearningLoss().to(device)
@@ -567,9 +633,8 @@ class v8JDELoss:
 
         if fg_mask.sum():
             # Bbox loss
-            target_bboxes /= stride_tensor
             loss[0], loss[2] = self.bbox_loss(
-                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
+                pred_distri, pred_bboxes, anchor_points, target_bboxes / stride_tensor, target_scores, target_scores_sum, fg_mask, imgsz, stride_tensor
             )
 
             # Embedding loss
@@ -582,7 +647,7 @@ class v8JDELoss:
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
-        loss[3] *= self.hyp.clr  # contrastive embedding gain
+        loss[3] *= getattr(self.hyp, "clr", 1.0)  # contrastive embedding gain
 
         return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl, embed)
 

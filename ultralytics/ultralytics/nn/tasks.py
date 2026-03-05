@@ -407,6 +407,9 @@ class DetectionModel(BaseModel):
                 output = self.forward(x)
                 if self.end2end:
                     output = output["one2many"]
+                # JDE returns a plain list during training; Detect returns a dict with 'feats'
+                if isinstance(output, list):
+                    return output
                 return output["feats"]
 
             self.model.eval()  # Avoid changing batch statistics until training begins
@@ -1710,8 +1713,11 @@ def parse_model(d, ch, verbose=True):
             args.extend([reg_max, end2end, [ch[x] for x in f]])
             if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26, JDE}:
+            if m in {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:
                 m.legacy = legacy
+        elif m is JDE:  # JDE has different signature: (nc, embed_dim, ch) — no reg_max/end2end
+            args.append([ch[x] for x in f])
+            m.legacy = legacy
         elif m is v10Detect:
             args.append([ch[x] for x in f])
         elif m is ImagePoolingAttn:

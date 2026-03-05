@@ -1,6 +1,7 @@
 # Ultralytics YOLO 🚀, AGPL-3.0 license
 
 from pathlib import Path, PosixPath
+from typing import Any
 
 import numpy as np
 import torch
@@ -25,13 +26,11 @@ class JDEValidator(DetectionValidator):
         ```
     """
 
-    def __init__(self, dataloader=None, save_dir=None, pbar=None, args=None, _callbacks=None):
-        """Initialize SegmentationValidator and set task to 'segment', metrics to SegmentMetrics."""
-        super().__init__(dataloader, save_dir, pbar, args, _callbacks)
-        self.plot_masks = None
-        self.process = None
+    def __init__(self, dataloader=None, save_dir=None, args=None, _callbacks=None):
+        """Initialize JDEValidator and set task to 'jde', metrics to DetMetrics + ReIDMetrics."""
+        super().__init__(dataloader, save_dir, args, _callbacks)
         self.args.task = "jde"
-        self.metrics = DetMetrics(save_dir=self.save_dir, on_plot=self.on_plot)
+        self.metrics = DetMetrics()
         self.reid_metrics = ReIDMetrics()
 
     @smart_inference_mode()
@@ -45,92 +44,6 @@ class JDEValidator(DetectionValidator):
         stats = super().__call__(trainer, model)
         return stats
 
-    def _prepare_batch(self, si, batch):
-        """Prepares a batch of images and annotations for validation."""
-        idx = batch["batch_idx"] == si
-        cls = batch["cls"][idx].squeeze(-1)
-        tags = batch["tags"][idx].squeeze(-1)
-        bbox = batch["bboxes"][idx]
-        ori_shape = batch["ori_shape"][si]
-        imgsz = batch["img"].shape[2:]
-        if len(cls):
-            bbox = ops.xywh2xyxy(bbox) * torch.tensor(imgsz, device=self.device)[[1, 0, 1, 0]]  # target boxes
-            ops.scale_boxes(imgsz, bbox, ori_shape)  # native-space labels
-        return {"cls": cls, "bbox": bbox, "ori_shape": ori_shape, "imgsz": imgsz, "tags": tags}
-
-    def _prepare_pred(self, pred, pbatch):
-        """Prepares a batch of images and annotations for validation."""
-        predn = pred.clone()
-        ops.scale_boxes(pbatch["imgsz"], predn[:, :4], pbatch["ori_shape"])  # native-space pred
-        return predn
-
-    def update_metrics(self, preds, batch):
-        """Metrics."""
-        batch_matched_tags = []     # List to store matched tags for each batch
-        for si, pred in enumerate(preds):
-            self.seen += 1
-            npr = len(pred)
-            stat = dict(
-                conf=torch.zeros(0, device=self.device),
-                pred_cls=torch.zeros(0, device=self.device),
-                tp=torch.zeros(npr, self.niou, dtype=torch.bool, device=self.device),
-            )
-            matched_tags = torch.zeros(npr, dtype=torch.int, device=self.device)    # Initialize matched tags tensor
-            pbatch = self._prepare_batch(si, batch)
-            cls, bbox, tags = pbatch.pop("cls"), pbatch.pop("bbox"), pbatch.pop("tags")
-            nl = len(cls)
-            stat["target_cls"] = cls
-            stat["target_img"] = cls.unique()
-            if npr == 0:
-                if nl:
-                    for k in self.stats.keys():
-                        self.stats[k].append(stat[k])
-                    if self.args.plots:
-                        self.confusion_matrix.process_batch(detections=None, gt_bboxes=bbox, gt_cls=cls)
-                continue
-
-            # Predictions
-            if self.args.single_cls:
-                pred[:, 5] = 0
-            predn = self._prepare_pred(pred, pbatch)
-            stat["conf"] = predn[:, 4]
-            stat["pred_cls"] = predn[:, 5]
-
-            # Evaluate
-            if nl:
-                stat["tp"], matched_tags = self._process_batch(predn, bbox, cls, tags)  # correct, matched_tags
-                if self.args.plots:
-                    self.confusion_matrix.process_batch(predn, bbox, cls)
-            for k in self.stats.keys():
-                self.stats[k].append(stat[k])
-            batch_matched_tags.append(matched_tags)   # Append matched tags to list
-
-            # Save
-            if self.args.save_json:
-                self.pred_to_json(predn, batch["im_file"][si])
-            if self.args.save_txt:
-                self.save_one_txt(
-                    predn,
-                    self.args.save_conf,
-                    pbatch["ori_shape"],
-                    self.save_dir / "labels" / f'{Path(batch["im_file"][si]).stem}.txt',
-                )
-        # Process batch for reid metrics
-        self.reid_metrics.process_batch(preds, batch_matched_tags)
-
-    def get_stats(self):
-        """Returns metrics statistics and results dictionary."""
-        stats = {k: torch.cat(v, 0).cpu().numpy() for k, v in self.stats.items()}  # to numpy
-        self.nt_per_class = np.bincount(stats["target_cls"].astype(int), minlength=self.nc)
-        self.nt_per_image = np.bincount(stats["target_img"].astype(int), minlength=self.nc)
-        stats.pop("target_img", None)
-        if len(stats) and stats["tp"].any():
-            self.metrics.process(**stats)
-            reid_metrics = self.reid_metrics.get_metrics()
-        detector_results = self.metrics.results_dict
-        detector_results.update(reid_metrics)
-        return detector_results
-
     def preprocess(self, batch):
         """Preprocesses batch by converting masks to float and sending to device."""
         batch = super().preprocess(batch)
@@ -138,9 +51,17 @@ class JDEValidator(DetectionValidator):
         return batch
 
     def postprocess(self, preds):
-        """Apply Non-maximum suppression to prediction outputs."""
-        return ops.non_max_suppression(
-            preds[0],
+        """Apply Non-maximum suppression to prediction outputs.
+
+        JDE.forward() returns (y, x) during inference where y is the decoded tensor.
+        We extract y (index 0) and pass to NMS, then return list of dicts.
+        """
+        # JDE inference returns (decoded_tensor, raw_list) — take the decoded tensor
+        if isinstance(preds, (tuple, list)):
+            preds = preds[0]
+
+        outputs = ops.non_max_suppression(
+            preds,
             self.args.conf,
             self.args.iou,
             labels=self.lb,
@@ -149,56 +70,142 @@ class JDEValidator(DetectionValidator):
             max_det=self.args.max_det,
             nc=self.nc,
         )
+        # Return list of dicts compatible with DetectionValidator API
+        # Each tensor: [x1, y1, x2, y2, conf, cls, embed...]
+        return [{"bboxes": x[:, :4], "conf": x[:, 4], "cls": x[:, 5], "extra": x[:, 6:]} for x in outputs]
 
-    def _process_batch(self, detections, gt_bboxes, gt_cls, gt_tags):
+    def _prepare_batch(self, si, batch):
+        """Prepares a batch of images and annotations for validation."""
+        idx = batch["batch_idx"] == si
+        cls = batch["cls"][idx].squeeze(-1)
+        tags = batch["tags"][idx].squeeze(-1)
+        bbox = batch["bboxes"][idx]
+        ori_shape = batch["ori_shape"][si]
+        imgsz = batch["img"].shape[2:]
+        ratio_pad = batch["ratio_pad"][si]
+        if len(cls):
+            bbox = ops.xywh2xyxy(bbox) * torch.tensor(imgsz, device=self.device)[[1, 0, 1, 0]]  # target boxes
+        return {
+            "cls": cls,
+            "bboxes": bbox,
+            "ori_shape": ori_shape,
+            "imgsz": imgsz,
+            "ratio_pad": ratio_pad,
+            "im_file": batch["im_file"][si],
+            "tags": tags,
+        }
+
+    def _prepare_pred(self, pred, pbatch=None):
+        """Prepares a batch of images and annotations for validation."""
+        if self.args.single_cls:
+            pred["cls"] *= 0
+        return pred
+
+    def update_metrics(self, preds, batch):
+        """Metrics — updated for new DetectionValidator API (preds as list of dicts)."""
+        batch_matched_tags = []  # List to store matched tags for each batch
+        for si, pred in enumerate(preds):
+            self.seen += 1
+            pbatch = self._prepare_batch(si, batch)
+            tags = pbatch.pop("tags")
+            cls = pbatch["cls"]
+            bbox = pbatch["bboxes"]
+
+            cls_pred = pred["cls"]
+            conf_pred = pred["conf"]
+            npr = len(cls_pred)
+            nl = len(cls)
+
+            matched_tags = torch.zeros(npr, dtype=torch.int, device=self.device)
+            tp = np.zeros((npr, self.niou), dtype=bool)
+
+            # Evaluate matches if both preds and GT exist
+            if npr > 0 and nl > 0:
+                tp, matched_tags = self._process_batch(pred, bbox, cls, tags)
+                tp = tp.cpu().numpy()
+
+            self.metrics.update_stats(
+                {
+                    "target_cls": cls.cpu().numpy(),
+                    "target_img": cls.unique().cpu().numpy(),
+                    "conf": np.zeros(0) if npr == 0 else conf_pred.cpu().numpy(),
+                    "pred_cls": np.zeros(0) if npr == 0 else cls_pred.cpu().numpy(),
+                    "tp": tp,
+                }
+            )
+
+            if self.args.plots and npr > 0 and nl > 0:
+                self.confusion_matrix.process_batch(pred, pbatch, conf=self.args.conf)
+
+            batch_matched_tags.append(matched_tags)
+
+            # Save
+            if npr > 0 and (self.args.save_json or self.args.save_txt):
+                predn_scaled = self.scale_preds(pred, pbatch)
+                if self.args.save_json:
+                    self.pred_to_json(predn_scaled, pbatch)
+                if self.args.save_txt:
+                    self.save_one_txt(
+                        predn_scaled,
+                        self.args.save_conf,
+                        pbatch["ori_shape"],
+                        self.save_dir / "labels" / f"{Path(pbatch['im_file']).stem}.txt",
+                    )
+        # Process batch for reid metrics
+        self.reid_metrics.process_batch(preds, batch_matched_tags)
+
+
+    def get_stats(self):
+        """Returns metrics statistics and results dictionary."""
+        stats = self.metrics.process(save_dir=self.save_dir, plot=self.args.plots, on_plot=self.on_plot)
+        self.metrics.clear_stats()
+        reid_metrics = self.reid_metrics.get_metrics()
+        detector_results = self.metrics.results_dict
+        detector_results.update(reid_metrics)
+        return detector_results
+
+    def _process_batch(self, pred, gt_bboxes, gt_cls, gt_tags):
         """
-        Return correct prediction matrix.
+        Return correct prediction matrix and matched tags.
 
         Args:
-            detections (torch.Tensor): Tensor of shape (N, 6) representing detections where each detection is
-                (x1, y1, x2, y2, conf, class).
-            gt_bboxes (torch.Tensor): Tensor of shape (M, 4) representing ground-truth bounding box coordinates. Each
-                bounding box is of the format: (x1, y1, x2, y2).
-            gt_cls (torch.Tensor): Tensor of shape (M,) representing target class indices.
-            gt_tags (torch.Tensor): Tensor of shape (M,) representing target tags.
+            pred (dict): Prediction dict with 'bboxes' and 'cls' keys.
+            gt_bboxes (torch.Tensor): Ground-truth bounding boxes (M, 4).
+            gt_cls (torch.Tensor): Ground-truth class indices (M,).
+            gt_tags (torch.Tensor): Ground-truth tags (M,).
 
         Returns:
-            (torch.Tensor): Correct prediction matrix of shape (N, 10) for 10 IoU levels.
-
-        Note:
-            The function does not return any value directly usable for metrics calculation. Instead, it provides an
-            intermediate representation used for evaluating predictions against ground truth.
+            (torch.Tensor): Correct prediction matrix (N, 10).
+            (torch.Tensor): Matched tags tensor (N,).
         """
-        iou = box_iou(gt_bboxes, detections[:, :4])
-        return self.match_predictions(detections[:, 5], gt_cls, gt_tags, iou)
+        iou = box_iou(gt_bboxes, pred["bboxes"])
+        return self.match_predictions(pred["cls"], gt_cls, gt_tags, iou)
 
     def match_predictions(self, pred_classes, true_classes, true_tags, iou, use_scipy=False):
         """
-        Matches predictions to ground truth objects (pred_classes, true_classes) using IoU.
+        Matches predictions to ground truth objects using IoU.
 
         Args:
             pred_classes (torch.Tensor): Predicted class indices of shape(N,).
             true_classes (torch.Tensor): Target class indices of shape(M,).
             true_tags (torch.Tensor): Target tags of shape(M,).
-            iou (torch.Tensor): An NxM tensor containing the pairwise IoU values for predictions and ground of truth
-            use_scipy (bool): Whether to use scipy for matching (more precise).
+            iou (torch.Tensor): An NxM tensor containing the pairwise IoU values.
+            use_scipy (bool): Whether to use scipy for matching.
 
         Returns:
-            (torch.Tensor): Correct tensor of shape(N,10) for 10 IoU thresholds.
+            (torch.Tensor): Correct tensor of shape(N, 10) for 10 IoU thresholds.
+            (torch.Tensor): Matched tags tensor of shape(N,).
         """
-        # Initialize the list for storing matched tags using IoU threshold of 0.5
-        matched_tags = [False] * pred_classes.shape[0]  # Default to None if no match
+        matched_tags = [False] * pred_classes.shape[0]
 
-        # Dx10 matrix, where D - detections, 10 - IoU thresholds
         correct = np.zeros((pred_classes.shape[0], self.iouv.shape[0])).astype(bool)
-        # LxD matrix where L - labels (rows), D - detections (columns)
         correct_class = true_classes[:, None] == pred_classes
         iou = iou * correct_class  # zero out the wrong classes
         iou = iou.cpu().numpy()
+
         for i, threshold in enumerate(self.iouv.cpu().tolist()):
             if use_scipy:
-                # WARNING: known issue that reduces mAP in https://github.com/ultralytics/ultralytics/pull/4708
-                import scipy  # scope import to avoid importing for all commands
+                import scipy
 
                 cost_matrix = iou * (iou >= threshold)
                 if cost_matrix.any():
@@ -206,22 +213,23 @@ class JDEValidator(DetectionValidator):
                     valid = cost_matrix[labels_idx, detections_idx] > 0
                     if valid.any():
                         correct[detections_idx[valid], i] = True
-                        # Assign tags to matched predictions
                         if threshold == 0.5:
                             for gt_idx, pred_idx in zip(labels_idx[valid], detections_idx[valid]):
                                 matched_tags[pred_idx] = true_tags[gt_idx].item()
             else:
-                matches = np.nonzero(iou >= threshold)  # IoU > threshold and classes match
+                matches = np.nonzero(iou >= threshold)
                 matches = np.array(matches).T
                 if matches.shape[0]:
                     if matches.shape[0] > 1:
                         matches = matches[iou[matches[:, 0], matches[:, 1]].argsort()[::-1]]
                         matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
-                        # matches = matches[matches[:, 2].argsort()[::-1]]
                         matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
                     correct[matches[:, 1].astype(int), i] = True
-                    # Assign tags to matched predictions
                     if threshold == 0.5:
                         for gt_idx, pred_idx in matches:
                             matched_tags[pred_idx] = true_tags[gt_idx].item()
-        return torch.tensor(correct, dtype=torch.bool, device=pred_classes.device), torch.tensor(matched_tags, dtype=torch.int, device=pred_classes.device)
+
+        return (
+            torch.tensor(correct, dtype=torch.bool, device=pred_classes.device),
+            torch.tensor(matched_tags, dtype=torch.int, device=pred_classes.device),
+        )

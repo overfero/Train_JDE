@@ -796,10 +796,13 @@ class Mosaic(BaseMixTransform):
             return {}
         cls = []
         instances = []
+        tags = []
         imgsz = self.imgsz * 2  # mosaic imgsz
         for labels in mosaic_labels:
             cls.append(labels["cls"])
             instances.append(labels["instances"])
+            if "tags" in labels:
+                tags.append(labels["tags"])
         # Final labels
         final_labels = {
             "im_file": mosaic_labels[0]["im_file"],
@@ -809,9 +812,13 @@ class Mosaic(BaseMixTransform):
             "instances": Instances.concatenate(instances, axis=0),
             "mosaic_border": self.border,
         }
+        if tags:
+            final_labels["tags"] = np.concatenate(tags, 0)
         final_labels["instances"].clip(imgsz, imgsz)
         good = final_labels["instances"].remove_zero_area_boxes()
         final_labels["cls"] = final_labels["cls"][good]
+        if "tags" in final_labels:
+            final_labels["tags"] = final_labels["tags"][good]
         if "texts" in mosaic_labels[0]:
             final_labels["texts"] = mosaic_labels[0]["texts"]
         return final_labels
@@ -872,6 +879,8 @@ class MixUp(BaseMixTransform):
         labels["img"] = (labels["img"] * r + labels2["img"] * (1 - r)).astype(np.uint8)
         labels["instances"] = Instances.concatenate([labels["instances"], labels2["instances"]], axis=0)
         labels["cls"] = np.concatenate([labels["cls"], labels2["cls"]], 0)
+        if "tags" in labels and "tags" in labels2:
+            labels["tags"] = np.concatenate([labels["tags"], labels2["tags"]], 0)
         return labels
 
 
@@ -1297,6 +1306,8 @@ class RandomPerspective:
         )
         labels["instances"] = new_instances[i]
         labels["cls"] = cls[i]
+        if "tags" in labels:
+            labels["tags"] = labels["tags"][i]
         labels["img"] = img
         labels["resized_shape"] = img.shape[:2]
         return labels
@@ -2084,6 +2095,8 @@ class Format:
         labels["img"] = self._format_img(img)
         labels["cls"] = torch.from_numpy(cls) if nl else torch.zeros(nl, 1)
         labels["bboxes"] = torch.from_numpy(instances.bboxes) if nl else torch.zeros((nl, 4))
+        if "tags" in labels:
+            labels["tags"] = torch.from_numpy(labels["tags"]).view(-1, 1).float() if nl else torch.zeros((nl, 1))
         if self.return_keypoint:
             labels["keypoints"] = (
                 torch.empty(0, 3) if instances.keypoints is None else torch.from_numpy(instances.keypoints)

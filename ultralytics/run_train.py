@@ -1,14 +1,14 @@
 from ultralytics import YOLO
 
-model = YOLO("yolo11s-jde.yaml", task="jde").load("yolo11s.pt")
+model = YOLO("yolo26s-jde.yaml", task="jde").load("weights/best.pt")
 
 model.train(
     # Dataset
-    data="crowdhuman_mot20_custom.yaml",
+    data="CrowdHuman/data.yaml",
 
     # Full training setup (from paper)
     epochs=100,
-    batch=64,
+    batch=16,
     imgsz=1280,
 
     # JDE critical — mosaic never turned off
@@ -25,9 +25,5 @@ model.train(
 
     # Logging
     project="runs/jde",
-    name="crowdhuman_mot20_custom_100e_64b",
-
-    # Recommended untuk JDE
-    workers=2,
-    cache=True,
+    name="crowdhuman_mot20",
 )

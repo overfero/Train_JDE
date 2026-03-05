@@ -256,7 +256,7 @@ class JDE(Detect):
 
     def __init__(self, nc=80, embed_dim=128, ch=()):
         """Initialize the YOLO model attributes such as the number of classes, embedding dimension, and the convolution."""
-        super().__init__(nc, ch)
+        super().__init__(nc=nc, ch=ch)
         self.embed_dim = embed_dim  # embedding dimension
         self.no = nc + self.reg_max * 4 + embed_dim     # number of outputs per anchor
         # TODO: maybe min as a bottleneck?
