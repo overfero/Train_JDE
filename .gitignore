@@ -205,4 +205,5 @@ args.yaml
 results.csv
 
 CrowdHuman/
+crowdhuman/
 runs/
