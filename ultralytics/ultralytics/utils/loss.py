@@ -94,6 +94,17 @@ class MetricLearningLoss(nn.Module):
         self.confidence_threshold = 1
 
     def forward(self, embeddings, tags, confidences=None, normalize=False):
+        max_samples = 2000
+        if len(embeddings) > max_samples:
+            if confidences is not None:
+                _, indices = torch.topk(confidences, max_samples, largest=True)
+            else:
+                indices = torch.randperm(len(embeddings), device=embeddings.device)[:max_samples]
+            embeddings = embeddings[indices]
+            tags = tags[indices]
+            if confidences is not None:
+                confidences = confidences[indices]
+        
         # Select only the embeddings and tags for confidences on top X%
         if confidences is not None and self.confidence_threshold<1:
             top_k = int(self.confidence_threshold * len(confidences))
