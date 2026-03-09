@@ -8,6 +8,7 @@ import torch
 
 from ultralytics.models.yolo.detect import DetectionValidator
 from ultralytics.utils import ops
+from ultralytics.utils.nms import non_max_suppression
 from ultralytics.utils.metrics import DetMetrics, box_iou, ReIDMetrics
 from ultralytics.utils.torch_utils import smart_inference_mode
 
@@ -40,7 +41,7 @@ class JDEValidator(DetectionValidator):
             self.epoch = trainer.epoch + 1
             self.best = trainer.best
         if model is not None:
-            self.model_path = model if (isinstance(model, str) or isinstance(model, PosixPath)) else model.pt_path
+            self.model_path = model if (isinstance(model, str) or isinstance(model, PosixPath)) else getattr(model, "pt_path", "")
         stats = super().__call__(trainer, model)
         return stats
 
@@ -60,11 +61,10 @@ class JDEValidator(DetectionValidator):
         if isinstance(preds, (tuple, list)):
             preds = preds[0]
 
-        outputs = ops.non_max_suppression(
+        outputs = non_max_suppression(
             preds,
             self.args.conf,
             self.args.iou,
-            labels=self.lb,
             multi_label=True,
             agnostic=self.args.single_cls or self.args.agnostic_nms,
             max_det=self.args.max_det,
@@ -152,7 +152,8 @@ class JDEValidator(DetectionValidator):
                         self.save_dir / "labels" / f"{Path(pbatch['im_file']).stem}.txt",
                     )
         # Process batch for reid metrics
-        self.reid_metrics.process_batch(preds, batch_matched_tags)
+        reid_preds = [torch.cat((p["bboxes"], p["conf"][:, None], p["cls"][:, None], p["extra"]), dim=1) for p in preds]
+        self.reid_metrics.process_batch(reid_preds, batch_matched_tags)
 
 
     def get_stats(self):

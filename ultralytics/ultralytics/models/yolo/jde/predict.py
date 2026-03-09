@@ -3,6 +3,7 @@
 from ultralytics.engine.results import Results
 from ultralytics.engine.predictor import BasePredictor
 from ultralytics.utils import DEFAULT_CFG, ops
+from ultralytics.utils.nms import non_max_suppression
 
 
 class JDEPredictor(BasePredictor):
@@ -27,7 +28,7 @@ class JDEPredictor(BasePredictor):
 
     def postprocess(self, preds, img, orig_imgs):
         """Applies non-max suppression and processes detections for each image in an input batch."""
-        preds = ops.non_max_suppression(
+        preds = non_max_suppression(
             preds[0],
             self.args.conf,
             self.args.iou,

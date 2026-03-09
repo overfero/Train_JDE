@@ -11,6 +11,8 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+import sklearn.metrics as skm
 
 from ultralytics.utils import LOGGER, DataExportMixin, SimpleClass, TryExcept, checks, plt_settings
 
@@ -79,8 +81,25 @@ class ReIDMetrics(SimpleClass):
             Dict[str, float]: A dictionary containing the ReID metrics for the current epoch.
         """
         # Concatenate and convert to numpy arrays
-        embeds = torch.cat(self.embeds).cpu().detach().numpy()
-        tags = torch.cat(self.tags).cpu().detach().numpy()
+        if len(self.embeds) == 0:
+            embeds = np.zeros((0, 128))
+            tags = np.zeros(0)
+        else:
+            embeds = torch.cat(self.embeds).cpu().detach().numpy()
+            tags = torch.cat(self.tags).cpu().detach().numpy()
+
+        if len(embeds) == 0 or len(np.unique(tags)) < 2:
+            metrics = {
+                "val/pos_cos": 0.0, "val/neg_cos": 0.0, "val/pos_euc": 0.0, "val/neg_euc": 0.0,
+                "val/cos_sep_ratio": 0.0, "val/euc_sep_ratio": 0.0,
+                "val/cos_silhouette": 0.0, "val/euc_silhouette": 0.0,
+                "val/davies_bouldin": 0.0, "val/calinski_harabasz": 0.0,
+                "val/r1_acc": 0.0, "val/r5_acc": 0.0, "val/mean_ap": 0.0,
+                "val/hota": self.hota, "val/mota": self.mota, "val/idf1": self.idf1,
+            }
+            self.embeds = []
+            self.tags = []
+            return metrics
 
         # Compute distance matrix and positive and negative distances
         pos_cos, neg_cos, cos_distmat = self.compute_distmat(embeds, tags, distance="cosine")
