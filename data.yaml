@@ -1,0 +1,13 @@
+path: /kaggle/input/datasets/fehruputra
+train:
+  - crowdhuman/images/train
+  - mot-dataset/images
+val:
+  - crowdhuman/images/val
+
+# number of classes
+nc: 1
+
+# class names
+names:
+  0: person

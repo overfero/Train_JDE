@@ -1,10 +1,10 @@
 from ultralytics import YOLO
 
-model = YOLO("yolo26s-jde.yaml", task="jde").load("weights/best.pt")
+model = YOLO("yolo26s-jde.yaml", task="jde").load("best.pt")
 
 model.train(
     # Dataset
-    data="CrowdHuman/data.yaml",
+    data="data.yaml",
 
     # Full training setup (from paper)
     epochs=100,
@@ -18,12 +18,12 @@ model.train(
     patience=25,
 
     # Device — sesuaikan dengan GPU yang tersedia
-    device=0,  # single GPU, ganti ke [0,1,...] kalau multi-GPU
+    device=[0,1],  # single GPU, ganti ke [0,1,...] kalau multi-GPU
 
     # Pretrained weights
     # sudah di-load via .load() di atas
 
     # Logging
     project="runs/jde",
-    name="crowdhuman_mot20",
+    name="crowdmot",
 )
