@@ -316,10 +316,24 @@ class BasePredictor:
                 ops.Profile(device=self.device),
             )
             self.run_callbacks("on_predict_start")
-            for batch in self.dataset:
-                self.batch = batch
-                self.run_callbacks("on_predict_batch_start")
+
+            # Profiler tambahan untuk bagian di luar preprocess/inference/postprocess
+            p_load  = ops.Profile(device=self.device)  # data loading (nvdec decode)
+            p_track = ops.Profile(device=self.device)  # tracking (on_predict_batch_end)
+            p_write = ops.Profile(device=self.device)  # write_results / VideoWriter
+
+            _dataset_iter = iter(self.dataset)
+            while True:
+                # next() HARUS di dalam p_load agar waktu decode benar-benar terukur
+                with p_load:
+                    try:
+                        _batch_raw = next(_dataset_iter)
+                    except StopIteration:
+                        break
+                self.batch = _batch_raw
                 paths, im0s, s = self.batch
+
+                self.run_callbacks("on_predict_batch_start")
 
                 # Preprocess
                 with profilers[0]:
@@ -340,15 +354,16 @@ class BasePredictor:
                 # Visualize, save, write results
                 n = len(im0s)
                 try:
-                    for i in range(n):
-                        self.seen += 1
-                        self.results[i].speed = {
-                            "preprocess": profilers[0].dt * 1e3 / n,
-                            "inference": profilers[1].dt * 1e3 / n,
-                            "postprocess": profilers[2].dt * 1e3 / n,
-                        }
-                        if self.args.verbose or self.args.save or self.args.save_txt or self.args.show:
-                            s[i] += self.write_results(i, Path(paths[i]), im, s)
+                    with p_write:
+                        for i in range(n):
+                            self.seen += 1
+                            self.results[i].speed = {
+                                "preprocess": profilers[0].dt * 1e3 / n,
+                                "inference": profilers[1].dt * 1e3 / n,
+                                "postprocess": profilers[2].dt * 1e3 / n,
+                            }
+                            if self.args.verbose or self.args.save or self.args.save_txt or self.args.show:
+                                s[i] += self.write_results(i, Path(paths[i]), im, s)
                 except StopIteration:
                     break
 
@@ -356,8 +371,15 @@ class BasePredictor:
                 if self.args.verbose:
                     LOGGER.info("\n".join(s))
 
-                self.run_callbacks("on_predict_batch_end")
+                # on_predict_batch_end = tempat tracking update (BotSORT/ByteTrack)
+                with p_track:
+                    self.run_callbacks("on_predict_batch_end")
                 yield from self.results
+
+            # Simpan extra profiler ke attributes supaya bisa diakses setelah run
+            self._p_load  = p_load
+            self._p_track = p_track
+            self._p_write = p_write
 
         # Release assets
         for v in self.vid_writer.values():
@@ -368,11 +390,42 @@ class BasePredictor:
             cv2.destroyAllWindows()  # close any open windows
 
         # Print final results
-        if self.args.verbose and self.seen:
-            t = tuple(x.t / self.seen * 1e3 for x in profilers)  # speeds per image
+        if self.seen:
+            t = tuple(x.t / self.seen * 1e3 for x in profilers)  # avg ms per image
+            # Extra profilers (hanya ada kalau stream_inference sudah dijalankan)
+            tl = getattr(self, "_p_load",  None)
+            tk = getattr(self, "_p_track", None)
+            tw = getattr(self, "_p_write", None)
+            t_load  = (tl.t / self.seen * 1e3) if tl else 0.0
+            t_track = (tk.t / self.seen * 1e3) if tk else 0.0
+            t_write = (tw.t / self.seen * 1e3) if tw else 0.0
+            t_total = t[0] + t[1] + t[2] + t_load + t_track + t_write
+
+            self.speed_stats = {
+                "load":        t_load,
+                "preprocess":  t[0],
+                "inference":   t[1],
+                "postprocess": t[2],
+                "tracking":    t_track,
+                "write":       t_write,
+                "total_profiled": t_total,
+            }
+
+            sep = "─" * 52
             LOGGER.info(
-                f"Speed: %.1fms preprocess, %.1fms inference, %.1fms postprocess per image at shape "
-                f"{(min(self.args.batch, self.seen), getattr(self.model, 'ch', 3), *im.shape[2:])}" % t
+                f"\n{sep}\n"
+                f"  Pipeline breakdown (avg per frame, {self.seen} frames)\n"
+                f"{sep}\n"
+                f"  {'load (decode+IO)':<22} {t_load:>7.1f} ms  ({t_load/t_total*100:>4.1f}%)\n"
+                f"  {'preprocess':<22} {t[0]:>7.1f} ms  ({t[0]/t_total*100:>4.1f}%)\n"
+                f"  {'inference':<22} {t[1]:>7.1f} ms  ({t[1]/t_total*100:>4.1f}%)\n"
+                f"  {'postprocess':<22} {t[2]:>7.1f} ms  ({t[2]/t_total*100:>4.1f}%)\n"
+                f"  {'tracking (callback)':<22} {t_track:>7.1f} ms  ({t_track/t_total*100:>4.1f}%)\n"
+                f"  {'write_results':<22} {t_write:>7.1f} ms  ({t_write/t_total*100:>4.1f}%)\n"
+                f"{sep}\n"
+                f"  {'TOTAL (profiled)':<22} {t_total:>7.1f} ms  → {1000/t_total:.1f} FPS theoretical\n"
+                f"  shape {(min(self.args.batch, self.seen), getattr(self.model, 'ch', 3), *im.shape[2:])}\n"
+                f"{sep}"
             )
         if self.args.save or self.args.save_txt or self.args.save_crop:
             nl = len(list(self.save_dir.glob("labels/*.txt")))  # number of labels

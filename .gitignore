@@ -207,3 +207,6 @@ results.csv
 CrowdHuman/
 crowdhuman/
 runs/
+
+
+!yolo26s.engine

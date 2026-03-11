@@ -1,5 +1,9 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
+import torch
+import torch.nn.functional as F
+import numpy as np
+
 from ultralytics.engine.predictor import BasePredictor
 from ultralytics.engine.results import Results
 from ultralytics.utils import nms, ops
@@ -29,6 +33,75 @@ class DetectionPredictor(BasePredictor):
         >>> predictor = DetectionPredictor(overrides=args)
         >>> predictor.predict_cli()
     """
+
+    # ── Pinned-memory buffer (dialokasi sekali, reused tiap frame) ────────────
+    _pinned_buf: torch.Tensor | None = None
+    _pinned_shape: tuple | None = None
+
+    def preprocess(self, im):
+        """GPU-native preprocess: pinned-memory upload → semua transform di CUDA.
+
+        Mengganti pipeline CPU (np.stack → transpose → ascontiguousarray → from_numpy → .to(device))
+        dengan pipeline yang jauh lebih cepat:
+          1. np.stack sekali di CPU
+          2. Transfer ke pinned memory (non-blocking DMA ke GPU)
+          3. Semua transform (BGR→RGB, BHWC→BCHW, letterbox-pad, /255) di GPU
+        """
+        if isinstance(im, torch.Tensor):
+            # Sudah tensor (dari LoadTensor), path lama
+            t = im.to(self.device)
+            return t.half() if self.model.fp16 else t.float()
+
+        # ── 1. Stack numpy frames: list[(H,W,C)] → (N,H,W,C) uint8 ──────────
+        arr = np.stack(im)  # (N,H,W,3) BGR uint8
+
+        # ── 2. Upload ke GPU via pinned memory (async DMA) ────────────────────
+        n, h, w, c = arr.shape
+        if (
+            DetectionPredictor._pinned_buf is None
+            or DetectionPredictor._pinned_shape != arr.shape
+        ):
+            DetectionPredictor._pinned_buf = torch.empty(
+                arr.shape, dtype=torch.uint8, pin_memory=True
+            )
+            DetectionPredictor._pinned_shape = arr.shape
+
+        DetectionPredictor._pinned_buf.copy_(torch.from_numpy(arr))
+        # non_blocking=True: DMA transfer terjadi paralel dengan CPU
+        t = DetectionPredictor._pinned_buf.to(self.device, non_blocking=True)
+
+        # ── 3. Semua transform di GPU ─────────────────────────────────────────
+        # BGR → RGB  (flip channel axis, tidak ada memory copy baru)
+        t = t.flip(3)  # (N,H,W,3)  BGR→RGB
+
+        # NHWC → NCHW
+        t = t.permute(0, 3, 1, 2).contiguous()  # (N,3,H,W)
+
+        # Cast ke fp16 / fp32 + normalize
+        t = t.half() if self.model.fp16 else t.float()
+        t /= 255.0
+
+        # ── 4. Letterbox resize+pad di GPU ────────────────────────────────────
+        target_h, target_w = self.imgsz
+        if (h, w) != (target_h, target_w):
+            # Hitung scale dengan aspect-ratio preserving
+            scale = min(target_h / h, target_w / w)
+            new_h, new_w = int(round(h * scale)), int(round(w * scale))
+
+            # Bilinear resize di GPU
+            t = F.interpolate(
+                t, size=(new_h, new_w), mode="bilinear", align_corners=False
+            )
+
+            # Pad ke target size (letterbox abu-abu 0.5)
+            pad_top = (target_h - new_h) // 2
+            pad_left = (target_w - new_w) // 2
+            pad_bottom = target_h - new_h - pad_top
+            pad_right = target_w - new_w - pad_left
+            # 114/255 ≈ 0.447 — nilai abu-abu standar letterbox YOLO
+            t = F.pad(t, (pad_left, pad_right, pad_top, pad_bottom), value=114.0 / 255.0)
+
+        return t
 
     def postprocess(self, preds, img, orig_imgs, **kwargs):
         """Post-process predictions and return a list of Results objects.

@@ -1,4 +1,5 @@
 from collections import defaultdict
+from contextlib import contextmanager
 from scipy.spatial.distance import cosine
 import cv2
 import numpy as np
@@ -6,6 +7,16 @@ import torch
 from ultralytics import YOLO
 from ultralytics.utils.plotting import Annotator, colors
 from tqdm import tqdm
+import time
+
+@contextmanager
+def cv2_resource(resource):
+    """Context manager for cleanly releasing OpenCV resources."""
+    try:
+        yield resource
+    finally:
+        if resource is not None:
+            resource.release()
 
 # ─── Device Check ────────────────────────────────────────────────────────────
 DEVICE = 0 if torch.cuda.is_available() else "cpu"
@@ -19,47 +30,27 @@ else:
 TRACKER_CFG = "botsort.yaml"
 VIDEO_IN    = "video2.mp4"
 VIDEO_OUT   = "output.mp4"
-LOG_PATH    = "sim1.txt"
 IMGSZ       = 1280
 
 track_history = defaultdict(lambda: [])
 model = YOLO("models/yolo26s.engine")
-cap   = cv2.VideoCapture(VIDEO_IN)
 
-w, h, fps    = (int(cap.get(x)) for x in (cv2.CAP_PROP_FRAME_WIDTH,
-                                            cv2.CAP_PROP_FRAME_HEIGHT,
-                                            cv2.CAP_PROP_FPS))
-total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-out = cv2.VideoWriter(VIDEO_OUT, cv2.VideoWriter_fourcc(*"MJPG"), fps, (w, h))
 
-frame_idx=0
-for _ in tqdm(range(total_frames), desc="Processing"):
-    ret, im0 = cap.read()
-    if not ret:
-        break
-    frame_idx += 1
+t_start = time.perf_counter()
+with cv2_resource(cv2.VideoCapture(VIDEO_IN)) as cap:
+    w, h, fps    = (int(cap.get(x)) for x in (cv2.CAP_PROP_FRAME_WIDTH,
+                                                cv2.CAP_PROP_FRAME_HEIGHT,
+                                                cv2.CAP_PROP_FPS))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_idx = 0
+    for _ in tqdm(range(total_frames), desc="Processing"):
+        ret, im0 = cap.read()
+        if not ret:
+            break
+        frame_idx += 1
 
-    results = model.track(im0, persist=True, verbose=True,
-                            tracker=TRACKER_CFG, device=DEVICE, half=True, imgsz=IMGSZ)
+        results = model.track(im0, persist=True, verbose=False,
+                                tracker=TRACKER_CFG, device=DEVICE, half=True, imgsz=IMGSZ)
 
-    # ── Draw bboxes ───────────────────────────────────────────────────────
-    active_ids, active_confs, active_cls = [], [], []
-    if results[0].boxes.id is not None:
-        annotator = Annotator(im0, line_width=2)
-        boxes     = results[0].boxes.xyxy.cpu()
-        track_ids = results[0].boxes.id.int().cpu().tolist()
-        confs     = results[0].boxes.conf.cpu().tolist()
-        clss      = results[0].boxes.cls.int().cpu().tolist()
-        for box, tid, conf, cls in zip(boxes, track_ids, confs, clss):
-            annotator.box_label(box,
-                label=f"ID:{tid} {model.names[cls]} {conf:.2f}",
-                color=colors(tid, True))
-            active_ids.append(tid); active_confs.append(conf); active_cls.append(cls)
-        im0 = annotator.result()
-
-        
-
-# ─── Cleanup ──────────────────────────────────────────────────────────────────
-out.release()
-cap.release()
-print(f"✅ Done! Video → {VIDEO_OUT}  |  Log → {LOG_PATH}")
+t_elapsed = time.perf_counter() - t_start
+print(f"⏱  Total time: {t_elapsed:.2f}s  |  avg {t_elapsed / 3648 * 1000:.1f} ms/frame  |  {3648 / t_elapsed:.1f} FPS")
