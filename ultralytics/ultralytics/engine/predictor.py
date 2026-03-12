@@ -38,6 +38,7 @@ from __future__ import annotations
 import platform
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -317,14 +318,20 @@ class BasePredictor:
             )
             self.run_callbacks("on_predict_start")
 
-            # Profiler tambahan untuk bagian di luar preprocess/inference/postprocess
-            p_load  = ops.Profile(device=self.device)  # data loading (nvdec decode)
-            p_track = ops.Profile(device=self.device)  # tracking (on_predict_batch_end)
+            # Profiler untuk setiap phase pipeline
+            p_load  = ops.Profile(device=self.device)  # data loading / nvdec decode
+            p_gap_a = ops.Profile(device=self.device)  # on_predict_batch_start callback
+            p_gap_b = ops.Profile(device=self.device)  # on_predict_postprocess_end callback
             p_write = ops.Profile(device=self.device)  # write_results / VideoWriter
+            p_track = ops.Profile(device=self.device)  # on_predict_batch_end (tracking)
+            p_yield = ops.Profile(device=self.device)  # yield + loop body user
+
+            # Wall-clock keseluruhan (perf_counter, bukan CUDA event)
+            _wall_start = time.perf_counter()
 
             _dataset_iter = iter(self.dataset)
             while True:
-                # next() HARUS di dalam p_load agar waktu decode benar-benar terukur
+                # --- LOAD: decode + IO ---
                 with p_load:
                     try:
                         _batch_raw = next(_dataset_iter)
@@ -333,25 +340,30 @@ class BasePredictor:
                 self.batch = _batch_raw
                 paths, im0s, s = self.batch
 
-                self.run_callbacks("on_predict_batch_start")
+                # --- GAP A: on_predict_batch_start ---
+                with p_gap_a:
+                    self.run_callbacks("on_predict_batch_start")
 
-                # Preprocess
+                # --- PREPROCESS ---
                 with profilers[0]:
                     im = self.preprocess(im0s)
 
-                # Inference
+                # --- INFERENCE ---
                 with profilers[1]:
                     preds = self.inference(im, *args, **kwargs)
                     if self.args.embed:
-                        yield from [preds] if isinstance(preds, torch.Tensor) else preds  # yield embedding tensors
+                        yield from [preds] if isinstance(preds, torch.Tensor) else preds
                         continue
 
-                # Postprocess
+                # --- POSTPROCESS ---
                 with profilers[2]:
                     self.results = self.postprocess(preds, im, im0s)
-                self.run_callbacks("on_predict_postprocess_end")
 
-                # Visualize, save, write results
+                # --- GAP B: on_predict_postprocess_end ---
+                with p_gap_b:
+                    self.run_callbacks("on_predict_postprocess_end")
+
+                # --- WRITE RESULTS ---
                 n = len(im0s)
                 try:
                     with p_write:
@@ -371,15 +383,25 @@ class BasePredictor:
                 if self.args.verbose:
                     LOGGER.info("\n".join(s))
 
-                # on_predict_batch_end = tempat tracking update (BotSORT/ByteTrack)
+                # --- TRACKING: on_predict_batch_end ---
                 with p_track:
                     self.run_callbacks("on_predict_batch_end")
-                yield from self.results
 
-            # Simpan extra profiler ke attributes supaya bisa diakses setelah run
-            self._p_load  = p_load
-            self._p_track = p_track
-            self._p_write = p_write
+                # --- YIELD: serahkan kontrol ke loop user, ukur waktu kembali ---
+                _t_before_yield = time.perf_counter()
+                yield from self.results
+                p_yield.t += time.perf_counter() - _t_before_yield
+
+            _wall_total = time.perf_counter() - _wall_start
+
+            # Simpan semua profiler ke attributes
+            self._p_load   = p_load
+            self._p_gap_a  = p_gap_a
+            self._p_gap_b  = p_gap_b
+            self._p_write  = p_write
+            self._p_track  = p_track
+            self._p_yield  = p_yield
+            self._wall_total = _wall_total
 
         # Release assets
         for v in self.vid_writer.values():
@@ -392,38 +414,58 @@ class BasePredictor:
         # Print final results
         if self.seen:
             t = tuple(x.t / self.seen * 1e3 for x in profilers)  # avg ms per image
-            # Extra profilers (hanya ada kalau stream_inference sudah dijalankan)
-            tl = getattr(self, "_p_load",  None)
-            tk = getattr(self, "_p_track", None)
-            tw = getattr(self, "_p_write", None)
-            t_load  = (tl.t / self.seen * 1e3) if tl else 0.0
-            t_track = (tk.t / self.seen * 1e3) if tk else 0.0
-            t_write = (tw.t / self.seen * 1e3) if tw else 0.0
-            t_total = t[0] + t[1] + t[2] + t_load + t_track + t_write
+
+            def _ms(p_attr):
+                p = getattr(self, p_attr, None)
+                return (p.t / self.seen * 1e3) if p else 0.0
+
+            t_load   = _ms("_p_load")
+            t_gap_a  = _ms("_p_gap_a")
+            t_gap_b  = _ms("_p_gap_b")
+            t_write  = _ms("_p_write")
+            t_track  = _ms("_p_track")
+            t_yield  = _ms("_p_yield")
+
+            t_total_profiled = t_load + t_gap_a + t[0] + t[1] + t[2] + t_gap_b + t_write + t_track + t_yield
+
+            # Wall-clock aktual per frame (dari perf_counter nyata)
+            wall_total   = getattr(self, "_wall_total", None)
+            t_wall_frame = (wall_total / self.seen * 1e3) if wall_total else 0.0
+            t_unaccounted = max(0.0, t_wall_frame - t_total_profiled)
 
             self.speed_stats = {
-                "load":        t_load,
-                "preprocess":  t[0],
-                "inference":   t[1],
-                "postprocess": t[2],
-                "tracking":    t_track,
-                "write":       t_write,
-                "total_profiled": t_total,
+                "load":             t_load,
+                "gap_a_cb_start":   t_gap_a,
+                "preprocess":       t[0],
+                "inference":        t[1],
+                "postprocess":      t[2],
+                "gap_b_cb_postend": t_gap_b,
+                "write":            t_write,
+                "tracking":         t_track,
+                "yield_loop":       t_yield,
+                "unaccounted":      t_unaccounted,
+                "total_profiled":   t_total_profiled,
+                "wall_per_frame":   t_wall_frame,
             }
 
-            sep = "─" * 52
+            sep = "─" * 58
             LOGGER.info(
                 f"\n{sep}\n"
                 f"  Pipeline breakdown (avg per frame, {self.seen} frames)\n"
                 f"{sep}\n"
-                f"  {'load (decode+IO)':<22} {t_load:>7.1f} ms  ({t_load/t_total*100:>4.1f}%)\n"
-                f"  {'preprocess':<22} {t[0]:>7.1f} ms  ({t[0]/t_total*100:>4.1f}%)\n"
-                f"  {'inference':<22} {t[1]:>7.1f} ms  ({t[1]/t_total*100:>4.1f}%)\n"
-                f"  {'postprocess':<22} {t[2]:>7.1f} ms  ({t[2]/t_total*100:>4.1f}%)\n"
-                f"  {'tracking (callback)':<22} {t_track:>7.1f} ms  ({t_track/t_total*100:>4.1f}%)\n"
-                f"  {'write_results':<22} {t_write:>7.1f} ms  ({t_write/t_total*100:>4.1f}%)\n"
+                f"  {'load (decode+IO)':<28} {t_load:>7.1f} ms  ({t_load/t_wall_frame*100:>4.1f}%)\n"
+                f"  {'gap_a (on_batch_start cb)':<28} {t_gap_a:>7.1f} ms  ({t_gap_a/t_wall_frame*100:>4.1f}%)\n"
+                f"  {'preprocess':<28} {t[0]:>7.1f} ms  ({t[0]/t_wall_frame*100:>4.1f}%)\n"
+                f"  {'inference':<28} {t[1]:>7.1f} ms  ({t[1]/t_wall_frame*100:>4.1f}%)\n"
+                f"  {'postprocess':<28} {t[2]:>7.1f} ms  ({t[2]/t_wall_frame*100:>4.1f}%)\n"
+                f"  {'gap_b (on_postprocess_end cb)':<28} {t_gap_b:>7.1f} ms  ({t_gap_b/t_wall_frame*100:>4.1f}%)\n"
+                f"  {'write_results':<28} {t_write:>7.1f} ms  ({t_write/t_wall_frame*100:>4.1f}%)\n"
+                f"  {'tracking (on_batch_end cb)':<28} {t_track:>7.1f} ms  ({t_track/t_wall_frame*100:>4.1f}%)\n"
+                f"  {'yield + loop body (user)':<28} {t_yield:>7.1f} ms  ({t_yield/t_wall_frame*100:>4.1f}%)\n"
+                f"  {'unaccounted (GC/sched/etc)':<28} {t_unaccounted:>7.1f} ms  ({t_unaccounted/t_wall_frame*100:>4.1f}%)\n"
                 f"{sep}\n"
-                f"  {'TOTAL (profiled)':<22} {t_total:>7.1f} ms  → {1000/t_total:.1f} FPS theoretical\n"
+                f"  {'TOTAL (profiled)':<28} {t_total_profiled:>7.1f} ms\n"
+                f"  {'TOTAL (wall-clock/frame)':<28} {t_wall_frame:>7.1f} ms  → {1000/t_wall_frame:.1f} FPS\n"
                 f"  shape {(min(self.args.batch, self.seen), getattr(self.model, 'ch', 3), *im.shape[2:])}\n"
                 f"{sep}"
             )

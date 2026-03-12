@@ -4,7 +4,7 @@ import time
 # model_name = "models/yolo26s_cpu.onnx"
 # model_name = "models/yolo26s_openvino_model"
 # model_name = "models/yolo26s_gpu_fp16.onnx"
-model_name = "models/yolo26s.engine"
+model_name = "last.pt"
 # model_name = "models/yolo26s_saved_model/yolo26s_float16.tflite"
 
 model = YOLO(model_name)
@@ -23,6 +23,7 @@ for r in model.track(
     tracker="botsort.yaml",
     stream=True,   # ← WAJIB untuk pipeline yang efisien
     verbose=False,
+    # save=True,
 ):
     frame_count += 1
     # Akses hasil di sini kalau perlu, misal:
